@@ -1,4 +1,5 @@
 #include "VaroniaBackOfficeManager.h"
+#include "VaroniaMqttLibrary.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "JsonObjectConverter.h"
@@ -7,6 +8,40 @@
 #include "HAL/PlatformFileManager.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "Engine/GameInstance.h"
+#include "Engine/StaticMesh.h"
+#include "TimerManager.h"
+#include "Camera/CameraComponent.h"
+#include "Components/SceneComponent.h"
+#include "Components/SplineComponent.h"
+#include "Components/SplineMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
+
+namespace
+{
+    const TCHAR* MSG_SKIPTUTO = TEXT("GET_SOFTPARTYSKIPTUTOANDSTART_RESULT");
+    const TCHAR* MSG_START    = TEXT("GET_SOFTPARTYSTART_RESULT");
+
+    // Crée un composant scène sur un acteur cible à l'exécution (équiv. node AddComponent du BP).
+    template <typename T>
+    T* AddRuntimeSceneComponent(AActor* Owner)
+    {
+        if (!Owner)
+        {
+            return nullptr;
+        }
+        T* Comp = NewObject<T>(Owner);
+        Comp->SetMobility(EComponentMobility::Movable);
+        if (USceneComponent* Root = Owner->GetRootComponent())
+        {
+            Comp->SetupAttachment(Root);
+        }
+        Comp->RegisterComponent();
+        return Comp;
+    }
+}
 
 // Define the log category
 DEFINE_LOG_CATEGORY(LogVaronia);
@@ -53,42 +88,317 @@ void UVaroniaBackOfficeManager::OnWorldCreated(UWorld* World, const UWorld::Init
 
     if (!World || !World->IsGameWorld()) return;
 
-    FString BPPath = TEXT("/VaroniaBackOffice/BP_Varonia.BP_Varonia_C");
-    UClass* Varonia = StaticLoadClass(AActor::StaticClass(), nullptr, *BPPath);
-
-
     if (!MqttHandler)
     {
+        const int32 RandomId = FMath::RandRange(0, 999999999);
         MqttHandler = NewObject<UVaroniaMqttClient>(this);
-        MqttHandler->Connect(CurrentConfig.MQTT_ServerIP, 1883, CurrentConfig.MQTT_IDClient);
-    
+        MqttHandler->Connect(CurrentConfig.MQTT_ServerIP, 1883, RandomId);
     }
 
-
-    if (Varonia)
+    // Cache le client et (re)démarre le bootstrap runtime pour ce monde (ex BeginPlay de BP_Varonia).
+    GetClient();
+    if (UGameInstance* GI = GetGameInstance())
     {
-        FActorSpawnParameters SpawnParams;
-        SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        Varonia_BP = World->SpawnActor<AActor>(Varonia, FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+        GI->GetTimerManager().SetTimer(ConnectTimerHandle, this, &UVaroniaBackOfficeManager::AfterConnectDelay, ConnectDelay, false);
+    }
+}
 
-#if WITH_EDITOR
-        if (Varonia_BP)
+// ============================================================================
+// Runtime bootstrap (ex EventGraph BP_Varonia)
+// ============================================================================
+
+void UVaroniaBackOfficeManager::AfterConnectDelay()
+{
+    if (MqttHandler && MqttHandler->IsConnected())
+    {
+        if (UGameInstance* GI = GetGameInstance())
         {
-            Varonia_BP->SetActorLabel(TEXT("[Global Varonia]"));
+            FTimerManager& TM = GI->GetTimerManager();
+            if (!TM.IsTimerActive(PingTimerHandle))   // un seul heartbeat, même sur changement de niveau
+            {
+                TM.SetTimer(PingTimerHandle, this, &UVaroniaBackOfficeManager::PingTick, PingInterval, true, PingInterval);
+            }
         }
-#endif
-
-        UE_LOG(LogVaronia, Log, TEXT("BP_Varonia spawned successfully"));
+        SubscribeTopic();
+        StartGameLogic();
+        BackOfficeIsReady.Broadcast();
     }
     else
     {
-        UE_LOG(LogVaronia, Error, TEXT("Failed to load BP_Varonia at: %s"), *BPPath);
+        UE_LOG(LogVaronia, Warning, TEXT("MQTT No Connected"));
+    }
+}
+
+void UVaroniaBackOfficeManager::PingTick()
+{
+    SetSoftState(CurrentSoftState);
+}
+
+void UVaroniaBackOfficeManager::StartGameLogic()
+{
+    if (IMqttClientInterface* Client = GetClient())
+    {
+        FOnMessageDelegate OnMessage;
+        OnMessage.BindDynamic(this, &UVaroniaBackOfficeManager::OnMqttMessage);
+        Client->SetOnMessageHandler(OnMessage);
+    }
+}
+
+void UVaroniaBackOfficeManager::OnMqttMessage(FMqttMessage Message)
+{
+    const FString& Body = Message.Message;
+
+    // BP Sequence then_0 : GET_SOFTPARTYSKIPTUTOANDSTART_RESULT -> OnStartWithoutTuto
+    if (Body.Contains(MSG_SKIPTUTO))
+    {
+        if (GameStarted)
+        {
+            UE_LOG(LogVaronia, Warning, TEXT("Game Already Started"));
+        }
+        else
+        {
+            UE_LOG(LogVaronia, Log, TEXT("Start Without Tuto"));
+            OnStartWithoutTuto.Broadcast();
+            GameStarted = true;
+        }
+    }
+
+    // BP Sequence then_1 : GET_SOFTPARTYSTART_RESULT -> OnStartWithTuto
+    if (Body.Contains(MSG_START))
+    {
+        if (GameStarted)
+        {
+            UE_LOG(LogVaronia, Warning, TEXT("Game Already Started"));
+        }
+        else
+        {
+            UE_LOG(LogVaronia, Log, TEXT("Start WithTuto"));
+            OnStartWithTuto.Broadcast();
+            GameStarted = true;
+        }
+    }
+}
+
+// ============================================================================
+// MQTT helpers / API (ex fonctions BP_Varonia)
+// ============================================================================
+
+IMqttClientInterface* UVaroniaBackOfficeManager::GetClient()
+{
+    if (MqttClientInterface.GetObject() == nullptr && MqttHandler)
+    {
+        MqttClientInterface = MqttHandler->GetMqttClient();
+    }
+    return MqttClientInterface.GetObject() ? MqttClientInterface.GetInterface() : nullptr;
+}
+
+void UVaroniaBackOfficeManager::PublishOnTopic(const FString& BaseTopic, const FString& Json)
+{
+    if (IMqttClientInterface* Client = GetClient())
+    {
+        FMqttMessage Msg;
+        Msg.Message = Json;
+        Msg.Topic = SetTopic(BaseTopic);
+        Msg.Retain = false;
+        Msg.Qos = 0;
+        Client->Publish(Msg);
+    }
+}
+
+FString UVaroniaBackOfficeManager::SetTopic(const FString& Topic) const
+{
+    const int32 Id = CurrentConfig.MQTT_IDClient;   // ID logique configuré (≠ ClientId random de connexion)
+    return Topic + TEXT("/") + FString::FromInt(Id);
+}
+
+FString UVaroniaBackOfficeManager::SetSoftState(ESoftState NewState)
+{
+    CurrentSoftState = NewState;
+
+    const int32 Id = CurrentConfig.MQTT_IDClient;   // ID logique configuré (≠ ClientId random de connexion)
+    const FString Json = UVaroniaMqttLibrary::FormatMqttMessage(Id, TEXT("SET_SOFTSTATE"), static_cast<int32>(NewState));
+
+    if (MqttHandler && MqttHandler->IsConnected())
+    {
+        PublishOnTopic(TEXT("UnityToServer"), Json);
+    }
+    return Json;
+}
+
+FString UVaroniaBackOfficeManager::SetSoftPartyStarted()
+{
+    const int32 Id = CurrentConfig.MQTT_IDClient;   // ID logique configuré (≠ ClientId random de connexion)
+    const FString Json = UVaroniaMqttLibrary::FormatMqttMessage(Id, TEXT("SET_SOFTPARTYSTARTED"), -1);
+
+    if (MqttHandler && MqttHandler->IsConnected())
+    {
+        PublishOnTopic(TEXT("UnityToServer"), Json);
+    }
+    return Json;
+}
+
+FString UVaroniaBackOfficeManager::SetSoftPartyClosed()
+{
+    const int32 Id = CurrentConfig.MQTT_IDClient;   // ID logique configuré (≠ ClientId random de connexion)
+    const FString Json = UVaroniaMqttLibrary::FormatMqttMessage(Id, TEXT("SET_SOFTPARTYCLOSED"), -1);
+
+    if (MqttHandler && MqttHandler->IsConnected())
+    {
+        PublishOnTopic(TEXT("UnityToServer"), Json);
+    }
+    return Json;
+}
+
+void UVaroniaBackOfficeManager::SubscribeTopic()
+{
+    if (MqttHandler && MqttHandler->IsConnected())
+    {
+        if (IMqttClientInterface* Client = GetClient())
+        {
+            Client->Subscribe(SetTopic(TEXT("ServerToUnity")), 0);
+        }
+    }
+}
+
+// ============================================================================
+// Spatial runtime (ex fonctions BP_Varonia)
+// ============================================================================
+
+void UVaroniaBackOfficeManager::SyncPosAndRot(AActor* PlayerVR)
+{
+    if (!PlayerVR)
+    {
+        return;
+    }
+    PlayerVR->SetActorLocation(SpatialConfig.SyncPosition);
+    PlayerVR->SetActorRotation(SpatialConfig.SyncRotation);
+}
+
+void UVaroniaBackOfficeManager::CoefMul(USceneComponent* PosMul, UCameraComponent* Camera)
+{
+    if (!PosMul || !Camera)
+    {
+        return;
+    }
+    const float Mult = SpatialConfig.Multiplier;
+    const FVector Cam = Camera->GetRelativeLocation();
+    PosMul->SetRelativeLocation(FVector(Cam.X * Mult, Cam.Y * Mult, 0.f));
+}
+
+void UVaroniaBackOfficeManager::SetSyncAndBoundaries(AActor* PlayerVR)
+{
+    SyncPosAndRot(PlayerVR);
+    SpawnBoundaries(PlayerVR);
+}
+
+FTransform UVaroniaBackOfficeManager::GetSyncTransform() const
+{
+    return FTransform(SpatialConfig.SyncRotation, SpatialConfig.SyncPosition);
+}
+
+void UVaroniaBackOfficeManager::EnsureBoundaryAssets()
+{
+    if (!SegmentMesh)
+    {
+        SegmentMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+    }
+    if (!PointMesh)
+    {
+        PointMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere"));
+    }
+    if (!LineMaterial)
+    {
+        LineMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/VaroniaBackOffice/M_LINE.M_LINE"));
+    }
+}
+
+void UVaroniaBackOfficeManager::SpawnBoundaries(AActor* PlayerVR)
+{
+    if (!PlayerVR)
+    {
+        return;
+    }
+    EnsureBoundaryAssets();
+
+    for (const FSpatialBoundary& Boundary : SpatialConfig.Boundaries)
+    {
+        USplineComponent* Spline = AddRuntimeSceneComponent<USplineComponent>(PlayerVR);
+        if (!Spline)
+        {
+            continue;
+        }
+
+        const FLinearColor CurrentColor = Boundary.BoundaryColor;
+
+        Spline->ClearSplinePoints(false);
+        for (int32 i = 0; i < Boundary.Points.Num(); ++i)
+        {
+            Spline->AddSplinePoint(Boundary.Points[i], ESplineCoordinateSpace::Local, false);
+            Spline->SetSplinePointType(i, ESplinePointType::Linear, false);
+        }
+        Spline->SetClosedLoop(true, true);
+
+        const int32 LastIndex = Boundary.Points.Num() - 1;
+        for (int32 i = 0; i <= LastIndex; ++i)
+        {
+            UMaterialInstanceDynamic* MID = LineMaterial
+                ? UMaterialInstanceDynamic::Create(LineMaterial, this)
+                : nullptr;
+            if (MID)
+            {
+                MID->SetVectorParameterValue(TEXT("BaseColor"), CurrentColor);
+            }
+
+            const FVector StartPos = Spline->GetLocationAtSplinePoint(i, ESplineCoordinateSpace::Local);
+            const FVector EndPos   = Spline->GetLocationAtSplinePoint(i + 1, ESplineCoordinateSpace::Local);
+            const FVector Tangent  = EndPos - StartPos;
+
+            if (USplineMeshComponent* SplineMesh = AddRuntimeSceneComponent<USplineMeshComponent>(PlayerVR))
+            {
+                SplineMesh->SetForwardAxis(ESplineMeshAxis::X, false);
+                if (SegmentMesh)
+                {
+                    SplineMesh->SetStaticMesh(SegmentMesh);
+                }
+                if (MID)
+                {
+                    SplineMesh->SetMaterial(0, MID);
+                }
+                SplineMesh->SetStartScale(SegmentScale, false);
+                SplineMesh->SetEndScale(SegmentScale, false);
+                SplineMesh->SetStartAndEnd(StartPos, Tangent, EndPos, Tangent, true);
+                SplineMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+            }
+
+            if (UStaticMeshComponent* Marker = AddRuntimeSceneComponent<UStaticMeshComponent>(PlayerVR))
+            {
+                if (PointMesh)
+                {
+                    Marker->SetStaticMesh(PointMesh);
+                }
+                if (MID)
+                {
+                    Marker->SetMaterial(0, MID);
+                }
+                Marker->SetRelativeLocation(StartPos);
+                Marker->SetWorldScale3D(FVector(PointScale));
+                Marker->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+            }
+        }
     }
 }
 
 
 void UVaroniaBackOfficeManager::Deinitialize()
 {
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        GI->GetTimerManager().ClearTimer(ConnectTimerHandle);
+        GI->GetTimerManager().ClearTimer(PingTimerHandle);
+    }
+
+    FWorldDelegates::OnPostWorldInitialization.RemoveAll(this);
+
     if (MqttHandler)
     {
         MqttHandler->Disconnect();
@@ -176,6 +486,14 @@ bool UVaroniaBackOfficeManager::LoadLBEConfig()
  
     JsonObject->SetNumberField(TEXT("MainHand"), (int32)CurrentConfig.MainHand);
     JsonObject->SetStringField(TEXT("PlayerName"), CurrentConfig.PlayerName);
+
+    JsonObject->SetBoolField(TEXT("ForceLegacyController"), CurrentConfig.ForceLegacyController);
+    JsonObject->SetNumberField(TEXT("Controller"), CurrentConfig.Controller);
+    JsonObject->SetStringField(TEXT("WeaponMAC"), CurrentConfig.WeaponMAC);
+    JsonObject->SetArrayField(TEXT("Devices"), TArray<TSharedPtr<FJsonValue>>());
+    JsonObject->SetNumberField(TEXT("HideMode"), CurrentConfig.HideMode);
+    JsonObject->SetBoolField(TEXT("Direct"), CurrentConfig.Direct);
+    JsonObject->SetStringField(TEXT("HeadsetName"), CurrentConfig.HeadsetName);
 
     FString OutputString;
     TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
@@ -294,14 +612,14 @@ bool UVaroniaBackOfficeManager::LoadSpatialConfig()
 
             SpatialConfig.Boundaries.Add(Boundary);
 
-            UE_LOG(LogVaronia, Verbose, TEXT("  Boundary [%s] � %d points | Main=%d | Visible=%d"),
+            UE_LOG(LogVaronia, Verbose, TEXT("  Boundary [%s] � %d points | Main=%d | Visible=%d"),
                 *Boundary.ID, Boundary.Points.Num(), Boundary.bMainBoundary, Boundary.bVisible);
         }
     }
 
     bSpatialConfigLoaded = true;
 
-    UE_LOG(LogVaronia, Log, TEXT("Spatial loaded: %s (%s) � %d boundaries"),
+    UE_LOG(LogVaronia, Log, TEXT("Spatial loaded: %s (%s) � %d boundaries"),
         *SpatialConfig.Name, *SpatialConfig.AreaValue, SpatialConfig.Boundaries.Num());
     UE_LOG(LogVaronia, Verbose, TEXT("  SyncPos: %s"), *SpatialConfig.SyncPosition.ToString());
     UE_LOG(LogVaronia, Verbose, TEXT("  SyncRot: %s"), *SpatialConfig.SyncRotation.ToString());
@@ -337,4 +655,50 @@ TArray<FSpatialBoundary> UVaroniaBackOfficeManager::GetSubBoundaries() const
         }
     }
     return Result;
+}
+
+TArray<FSpatialBoundary> UVaroniaBackOfficeManager::GetAllBoundaries() const
+{
+    return SpatialConfig.Boundaries;
+}
+
+TArray<FVector> UVaroniaBackOfficeManager::GetAllPoints() const
+{
+    TArray<FVector> Out;
+    for (const FSpatialBoundary& B : SpatialConfig.Boundaries)
+    {
+        Out.Append(B.Points);
+    }
+    return Out;
+}
+
+TArray<FVector> UVaroniaBackOfficeManager::GetMainBoundaryPoints() const
+{
+    for (const FSpatialBoundary& B : SpatialConfig.Boundaries)
+    {
+        if (B.bMainBoundary)
+        {
+            return B.Points;
+        }
+    }
+    return TArray<FVector>();
+}
+
+bool UVaroniaBackOfficeManager::GetWeaponBinding(int32 WeaponIndex, FWeaponBinding& OutBinding) const
+{
+    if (!CurrentConfig.ForceLegacyController && CurrentConfig.Devices.IsValidIndex(WeaponIndex))
+    {
+        OutBinding = CurrentConfig.Devices[WeaponIndex];
+        return true;
+    }
+
+    if (WeaponIndex == 0)
+    {
+        OutBinding = FWeaponBinding();
+        OutBinding.Controller = CurrentConfig.Controller;
+        OutBinding.SerialNumber = CurrentConfig.WeaponMAC;
+        return true;
+    }
+
+    return false;
 }

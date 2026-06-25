@@ -34,6 +34,31 @@ enum class ESoftState : uint8 {
 };
 
 // ========================
+// Weapon binding (multi-arme) — l'index dans FLBEConfig.Devices = weaponIndex
+// ========================
+
+USTRUCT(BlueprintType)
+struct FWeaponBinding {
+    GENERATED_BODY()
+
+    /** ID contrôleur / modèle d'arme (valeurs Unity: -1..777). int32 car hors plage uint8. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia|Devices")
+    int32 Controller = -1;
+
+    /** Numéro de série / MAC du device. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia|Devices")
+    FString SerialNumber;
+
+    /** ID de tracking (serial SteamVR, id OpenXR…). Exclusif avec ForceSteamId. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia|Devices")
+    FString TrackingId;
+
+    /** Force un index device SteamVR (-1 = auto). Exclusif avec TrackingId. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia|Devices")
+    int32 ForceSteamId = -1;
+};
+
+// ========================
 // Global Config (GlobalConfig.json)
 // ========================
 
@@ -61,6 +86,38 @@ struct FLBEConfig {
 
     UPROPERTY(BlueprintReadWrite, Category = "Varonia")
     FString PlayerName = TEXT("Varonia Player");
+
+    // --- Legacy (mono-arme) ---
+
+    /** Force l'ancien système : ignore Devices et utilise Controller + WeaponMAC (arme 0). */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    bool ForceLegacyController = false;
+
+    /** Legacy : ID contrôleur de l'arme 0. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    int32 Controller = 0;
+
+    /** Legacy : MAC / serial de l'arme 0. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    FString WeaponMAC;
+
+    // --- Multi-armes ---
+
+    /** Liste typée d'armes ; l'index = weaponIndex. */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    TArray<FWeaponBinding> Devices;
+
+    // --- Divers ---
+
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    int32 HideMode = 0;
+
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    bool Direct = false;
+
+    /** Override manuel du nom de casque (vide = auto-détection). */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia")
+    FString HeadsetName;
 };
 
 // ========================

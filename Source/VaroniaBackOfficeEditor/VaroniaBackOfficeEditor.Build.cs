@@ -23,6 +23,11 @@ public class VaroniaBackOfficeEditor : ModuleRules
             "RenderCore",
             "RHI",
             "ImageWrapper",
+            "VaroniaBackOffice",   // FLBEConfig + enums (modèle GlobalConfig)
+            "Json",
+            "JsonUtilities",
+            "DesktopPlatform",     // dialogue Save As (Ortho)
+            "AppFramework",        // SColorPicker / OpenColorPicker
         });
     }
 }
