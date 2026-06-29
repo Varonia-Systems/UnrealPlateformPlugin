@@ -22,7 +22,7 @@ public class VaroniaBackOffice : ModuleRules
 			);
 
 
-        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "Json", "JsonUtilities", "MqttUtilities" });
+        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "ApplicationCore", "Slate", "SlateCore", "Json", "JsonUtilities", "MqttUtilities" });
 
 
 

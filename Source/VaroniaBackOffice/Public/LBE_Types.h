@@ -33,6 +33,40 @@ enum class ESoftState : uint8 {
     GAME_HOSTCONNECTING = 128
 };
 
+/**
+ * Boutons d'arme reçus via MQTT (topic DeviceToUnity/<MAC>/<key>).
+ * La valeur de l'enum = le numéro de touche du protocole :
+ * 1=Primary (gâchette/tir), 2=Secondary, 3=Tertiary, 4=Quaternary.
+ */
+UENUM(BlueprintType)
+enum class EVaroniaButton : uint8 {
+    None = 0,
+    Primary = 1,
+    Secondary = 2,
+    Tertiary = 3,
+    Quaternary = 4
+};
+
+/**
+ * Type / modèle d'arme (valeur lisible du champ Controller de FWeaponBinding).
+ * Mapping vers les IDs Unity du catalogue via ControllerIdToType / ControllerTypeToId.
+ * (Enum uint8 séquentiel : les IDs Unity 416/417/501/777 ne tiennent pas dans un uint8.)
+ */
+UENUM(BlueprintType)
+enum class EVaroniaController : uint8 {
+    Unknown            UMETA(DisplayName = "Unknown"),
+    Focus3_VaroniaGun  UMETA(DisplayName = "Focus3 VaroniaGun (3)"),
+    Pico_CTRL          UMETA(DisplayName = "Pico CTRL (6)"),
+    Focus3_Striker     UMETA(DisplayName = "Focus3 Striker (50)"),
+    Pico_VaroniaGun    UMETA(DisplayName = "Pico VaroniaGun (70)"),
+    Pico_Striker       UMETA(DisplayName = "Pico Striker (80)"),
+    Focus3_HK416       UMETA(DisplayName = "Focus3 HK416 (101)"),
+    Pico_HK416         UMETA(DisplayName = "Pico HK416 (416)"),
+    Pico_Glock         UMETA(DisplayName = "Pico Glock (417)"),
+    Vortex_Focus       UMETA(DisplayName = "Vortex Focus (501)"),
+    HMD                UMETA(DisplayName = "HMD (777)")
+};
+
 // ========================
 // Weapon binding (multi-arme) — l'index dans FLBEConfig.Devices = weaponIndex
 // ========================

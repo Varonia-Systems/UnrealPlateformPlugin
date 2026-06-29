@@ -18,6 +18,38 @@
 #include "Components/StaticMeshComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "GameFramework/PlayerController.h"
+#include "Engine/GameViewportClient.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Styling/CoreStyle.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Widgets/Input/SButton.h"
+
+// Capte le clavier globalement (sans composant ni focus particulier) pour l'overlay debug.
+class FVaroniaDebugInputProcessor : public IInputProcessor
+{
+public:
+    explicit FVaroniaDebugInputProcessor(UVaroniaBackOfficeManager* InOwner) : Owner(InOwner) {}
+
+    virtual void Tick(const float, FSlateApplication&, TSharedRef<ICursor>) override {}
+    virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& InKeyEvent) override
+    {
+        if (Owner.IsValid() && InKeyEvent.GetKey() == Owner->DebugMenuKey)
+        {
+            Owner->ToggleDebugMenu();
+            return true; // consomme la touche
+        }
+        return false;
+    }
+    virtual const TCHAR* GetDebugName() const override { return TEXT("VaroniaDebugMenu"); }
+
+private:
+    TWeakObjectPtr<UVaroniaBackOfficeManager> Owner;
+};
 
 namespace
 {
@@ -76,6 +108,13 @@ void UVaroniaBackOfficeManager::Initialize(FSubsystemCollectionBase& Collection)
     LoadSpatialConfig();
 
     FWorldDelegates::OnPostWorldInitialization.AddUObject(this, &UVaroniaBackOfficeManager::OnWorldCreated);
+
+    // Overlay debug global (F12) : capté via un input pre-processor Slate — aucun composant à ajouter.
+    if (FSlateApplication::IsInitialized())
+    {
+        DebugInputProcessor = MakeShared<FVaroniaDebugInputProcessor>(this);
+        FSlateApplication::Get().RegisterInputPreProcessor(DebugInputProcessor);
+    }
 }
 
 // ============================================================================
@@ -147,6 +186,13 @@ void UVaroniaBackOfficeManager::StartGameLogic()
 void UVaroniaBackOfficeManager::OnMqttMessage(FMqttMessage Message)
 {
     const FString& Body = Message.Message;
+
+    // Inputs d'arme (gâchette/tir) : topic DeviceToUnity/<MAC>/<key>.
+    if (Message.Topic.StartsWith(TEXT("DeviceToUnity")))
+    {
+        HandleDeviceInput(Message.Topic, Body);
+        return;
+    }
 
     // BP Sequence then_0 : GET_SOFTPARTYSKIPTUTOANDSTART_RESULT -> OnStartWithoutTuto
     if (Body.Contains(MSG_SKIPTUTO))
@@ -256,7 +302,240 @@ void UVaroniaBackOfficeManager::SubscribeTopic()
         if (IMqttClientInterface* Client = GetClient())
         {
             Client->Subscribe(SetTopic(TEXT("ServerToUnity")), 0);
+
+            // Inputs d'arme : tous les devices publient sur DeviceToUnity/<MAC>/<key>.
+            Client->Subscribe(TEXT("DeviceToUnity/#"), 2);
         }
+    }
+}
+
+// ============================================================================
+// Input arme (MQTT DeviceToUnity) — réplique MQTTInput.cs (Unity)
+// ============================================================================
+
+int32 UVaroniaBackOfficeManager::ResolveWeaponIndexByMac(const FString& Mac) const
+{
+    if (Mac.IsEmpty()) return -1;
+    for (int32 i = 0; i < CurrentConfig.Devices.Num(); ++i)
+    {
+        if (CurrentConfig.Devices[i].SerialNumber == Mac) return i;
+    }
+    return -1;
+}
+
+bool UVaroniaBackOfficeManager::GetWeaponButton(int32 WeaponIndex, EVaroniaButton Button) const
+{
+    if (!CurrentConfig.Devices.IsValidIndex(WeaponIndex)) return false;
+    const uint8* State = WeaponButtonState.Find(CurrentConfig.Devices[WeaponIndex].SerialNumber);
+    return State ? ((*State & (1 << (uint8)Button)) != 0) : false;
+}
+
+EVaroniaController UVaroniaBackOfficeManager::ControllerIdToType(int32 ControllerId) const
+{
+    switch (ControllerId)
+    {
+    case 3:   return EVaroniaController::Focus3_VaroniaGun;
+    case 6:   return EVaroniaController::Pico_CTRL;
+    case 50:  return EVaroniaController::Focus3_Striker;
+    case 70:  return EVaroniaController::Pico_VaroniaGun;
+    case 80:  return EVaroniaController::Pico_Striker;
+    case 101: return EVaroniaController::Focus3_HK416;
+    case 416: return EVaroniaController::Pico_HK416;
+    case 417: return EVaroniaController::Pico_Glock;
+    case 501: return EVaroniaController::Vortex_Focus;
+    case 777: return EVaroniaController::HMD;
+    default:  return EVaroniaController::Unknown;
+    }
+}
+
+int32 UVaroniaBackOfficeManager::ControllerTypeToId(EVaroniaController Type) const
+{
+    switch (Type)
+    {
+    case EVaroniaController::Focus3_VaroniaGun: return 3;
+    case EVaroniaController::Pico_CTRL:         return 6;
+    case EVaroniaController::Focus3_Striker:    return 50;
+    case EVaroniaController::Pico_VaroniaGun:   return 70;
+    case EVaroniaController::Pico_Striker:      return 80;
+    case EVaroniaController::Focus3_HK416:      return 101;
+    case EVaroniaController::Pico_HK416:        return 416;
+    case EVaroniaController::Pico_Glock:        return 417;
+    case EVaroniaController::Vortex_Focus:      return 501;
+    case EVaroniaController::HMD:               return 777;
+    default:                                    return -1;
+    }
+}
+
+EVaroniaController UVaroniaBackOfficeManager::GetWeaponController(int32 WeaponIndex) const
+{
+    if (!CurrentConfig.Devices.IsValidIndex(WeaponIndex)) return EVaroniaController::Unknown;
+    return ControllerIdToType(CurrentConfig.Devices[WeaponIndex].Controller);
+}
+
+int32 UVaroniaBackOfficeManager::FindWeaponIndexByController(EVaroniaController Type) const
+{
+    for (int32 i = 0; i < CurrentConfig.Devices.Num(); ++i)
+    {
+        if (ControllerIdToType(CurrentConfig.Devices[i].Controller) == Type) return i;
+    }
+    return -1;
+}
+
+TArray<int32> UVaroniaBackOfficeManager::FindWeaponIndicesByController(EVaroniaController Type) const
+{
+    TArray<int32> Out;
+    for (int32 i = 0; i < CurrentConfig.Devices.Num(); ++i)
+    {
+        if (ControllerIdToType(CurrentConfig.Devices[i].Controller) == Type) Out.Add(i);
+    }
+    return Out;
+}
+
+void UVaroniaBackOfficeManager::DebugStartWithTuto()
+{
+    UE_LOG(LogVaronia, Log, TEXT("[Debug] Start With Tuto"));
+    OnStartWithTuto.Broadcast();
+    GameStarted = true;
+}
+
+void UVaroniaBackOfficeManager::DebugStartWithoutTuto()
+{
+    UE_LOG(LogVaronia, Log, TEXT("[Debug] Start Without Tuto"));
+    OnStartWithoutTuto.Broadcast();
+    GameStarted = true;
+}
+
+// ============================================================================
+// Debug overlay (global, sans composant)
+// ============================================================================
+
+void UVaroniaBackOfficeManager::ToggleDebugMenu()
+{
+    bDebugMenuShown ? HideDebugMenu() : ShowDebugMenu();
+}
+
+void UVaroniaBackOfficeManager::ShowDebugMenu()
+{
+    if (bDebugMenuShown) return;
+    UGameInstance* GI = GetGameInstance();
+    if (!GI) return;
+    UGameViewportClient* VP = GI->GetGameViewportClient();
+    if (!VP) return;
+
+    DebugMenuWidget = BuildDebugMenu();
+    VP->AddViewportWidgetContent(DebugMenuWidget.ToSharedRef(), 1000);
+    bDebugMenuShown = true;
+
+    if (APlayerController* PC = GI->GetFirstLocalPlayerController(GetWorld()))
+    {
+        PC->bShowMouseCursor = true;
+        FInputModeGameAndUI Mode;
+        Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+        Mode.SetHideCursorDuringCapture(false);
+        PC->SetInputMode(Mode);
+    }
+}
+
+void UVaroniaBackOfficeManager::HideDebugMenu()
+{
+    if (!bDebugMenuShown) return;
+
+    if (UGameInstance* GI = GetGameInstance())
+    {
+        if (UGameViewportClient* VP = GI->GetGameViewportClient())
+        {
+            if (DebugMenuWidget.IsValid())
+            {
+                VP->RemoveViewportWidgetContent(DebugMenuWidget.ToSharedRef());
+            }
+        }
+        if (APlayerController* PC = GI->GetFirstLocalPlayerController(GetWorld()))
+        {
+            PC->bShowMouseCursor = false;
+            PC->SetInputMode(FInputModeGameOnly());
+        }
+    }
+
+    DebugMenuWidget.Reset();
+    bDebugMenuShown = false;
+}
+
+TSharedRef<SWidget> UVaroniaBackOfficeManager::BuildDebugMenu()
+{
+    auto MakeBtn = [this](const FString& Label, TFunction<void()> OnClick)
+    {
+        return SNew(SButton)
+            .HAlign(HAlign_Center)
+            .ContentPadding(FMargin(24.f, 10.f))
+            .OnClicked_Lambda([OnClick]() { OnClick(); return FReply::Handled(); })
+            [
+                SNew(STextBlock).Text(FText::FromString(Label)).Font(FCoreStyle::GetDefaultFontStyle("Bold", 13))
+            ];
+    };
+
+    return SNew(SBox).HAlign(HAlign_Center).VAlign(VAlign_Center)
+    [
+        SNew(SBorder)
+        .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+        .BorderBackgroundColor(FSlateColor(FLinearColor(0.05f, 0.05f, 0.06f, 0.94f)))
+        .Padding(24.f)
+        [
+            SNew(SVerticalBox)
+
+            + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(0, 0, 0, 16)
+            [
+                SNew(STextBlock)
+                .Text(FText::FromString(TEXT("VARONIA — DEBUG")))
+                .Font(FCoreStyle::GetDefaultFontStyle("Bold", 16))
+                .ColorAndOpacity(FSlateColor(FLinearColor(0.30f, 0.85f, 0.65f)))
+            ]
+
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+            [ MakeBtn(TEXT("Start With Tutorial"), [this]() { DebugStartWithTuto(); HideDebugMenu(); }) ]
+
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+            [ MakeBtn(TEXT("Start Without Tutorial"), [this]() { DebugStartWithoutTuto(); HideDebugMenu(); }) ]
+
+            + SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 0)
+            [ MakeBtn(TEXT("Close"), [this]() { HideDebugMenu(); }) ]
+        ]
+    ];
+}
+
+void UVaroniaBackOfficeManager::HandleDeviceInput(const FString& Topic, const FString& Body)
+{
+    // Topic = DeviceToUnity/<MAC>/<key>  (key 1..4) ; Body = "1" (appui) / "0" (relâché).
+    TArray<FString> Parts;
+    Topic.ParseIntoArray(Parts, TEXT("/"), true);
+    if (Parts.Num() < 3) return;
+
+    const FString Mac = Parts[1];
+    const FString Key = Parts.Last();
+
+    EVaroniaButton Button;
+    if      (Key == TEXT("1")) Button = EVaroniaButton::Primary;
+    else if (Key == TEXT("2")) Button = EVaroniaButton::Secondary;
+    else if (Key == TEXT("3")) Button = EVaroniaButton::Tertiary;
+    else if (Key == TEXT("4")) Button = EVaroniaButton::Quaternary;
+    else return;
+
+    const bool bPressed = (Body.TrimStartAndEnd() == TEXT("1"));
+
+    // Mémorise l'état (pour GetWeaponButton).
+    uint8& State = WeaponButtonState.FindOrAdd(Mac);
+    if (bPressed) State |= (1 << (uint8)Button);
+    else          State &= ~(1 << (uint8)Button);
+
+    const int32 WeaponIndex = ResolveWeaponIndexByMac(Mac);
+    const EVaroniaController Controller = GetWeaponController(WeaponIndex);
+
+    OnWeaponInput.Broadcast(WeaponIndex, Controller, Button, bPressed, Mac);
+
+    // Events tir dédiés : gâchette principale (down / up).
+    if (Button == EVaroniaButton::Primary)
+    {
+        if (bPressed) OnWeaponFire.Broadcast(WeaponIndex, Controller, Mac);
+        else          OnWeaponFireReleased.Broadcast(WeaponIndex, Controller, Mac);
     }
 }
 
@@ -391,6 +670,13 @@ void UVaroniaBackOfficeManager::SpawnBoundaries(AActor* PlayerVR)
 
 void UVaroniaBackOfficeManager::Deinitialize()
 {
+    HideDebugMenu();
+    if (DebugInputProcessor.IsValid() && FSlateApplication::IsInitialized())
+    {
+        FSlateApplication::Get().UnregisterInputPreProcessor(DebugInputProcessor);
+    }
+    DebugInputProcessor.Reset();
+
     if (UGameInstance* GI = GetGameInstance())
     {
         GI->GetTimerManager().ClearTimer(ConnectTimerHandle);

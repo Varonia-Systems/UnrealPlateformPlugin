@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
+#include "InputCoreTypes.h"                   // FKey / EKeys
 #include "LBE_Types.h"
 #include "VaroniaMqttClient.h"
 #include "Interface/MqttClientInterface.h"   // IMqttClientInterface, FOnMessageDelegate, FMqttMessage
@@ -15,10 +16,18 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnBackOfficeIsReady);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnVaroniaStartWithTuto);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnVaroniaStartWithoutTuto);
 
+// Input d'arme reçu via MQTT : (index dans Devices ou -1, type d'arme, bouton, pressé, MAC)
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(FOnVaroniaWeaponInput, int32, WeaponIndex, EVaroniaController, Controller, EVaroniaButton, Button, bool, bPressed, const FString&, Mac);
+
+// Tir : gâchette principale (Primary) enfoncée. (index dans Devices ou -1, type d'arme, MAC)
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnVaroniaWeaponFire, int32, WeaponIndex, EVaroniaController, Controller, const FString&, Mac);
+
 class UStaticMesh;
 class UMaterialInterface;
 class USceneComponent;
 class UCameraComponent;
+class SWidget;
+class FVaroniaDebugInputProcessor;
 
 UCLASS()
 class VARONIABACKOFFICE_API UVaroniaBackOfficeManager : public UGameInstanceSubsystem
@@ -70,6 +79,25 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "Varonia")
     FOnVaroniaStartWithoutTuto OnStartWithoutTuto;
 
+    /**
+     * Tir / bouton d'arme reçu via MQTT (DeviceToUnity/<MAC>/<key>).
+     * Bind tôt (BeginPlay). bPressed = true à l'appui, false au relâché.
+     * Pour le tir principal : filtrer Button == Primary && bPressed.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Varonia|Input")
+    FOnVaroniaWeaponInput OnWeaponInput;
+
+    /**
+     * Tir (down) : se déclenche au moment où la gâchette principale (Primary) est enfoncée,
+     * pour n'importe quelle arme. Filtrer WeaponIndex == 0 pour la 1re arme.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Varonia|Input")
+    FOnVaroniaWeaponFire OnWeaponFire;
+
+    /** Tir (up) : gâchette principale (Primary) relâchée. */
+    UPROPERTY(BlueprintAssignable, Category = "Varonia|Input")
+    FOnVaroniaWeaponFire OnWeaponFireReleased;
+
     // --- Réglages réseau ---
 
     // Interne : délai avant le check de connexion MQTT (s). Non exposé au BP.
@@ -111,6 +139,59 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Varonia|MQTT")
     void SubscribeTopic();
+
+    // --- Input arme (MQTT DeviceToUnity) ---
+
+    /** État courant d'un bouton d'arme (true = maintenu). Pour le tir : (idx, Primary). */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    bool GetWeaponButton(int32 WeaponIndex, EVaroniaButton Button) const;
+
+    /** Index dans Devices du 1er device dont SerialNumber == Mac (-1 si introuvable). */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    int32 ResolveWeaponIndexByMac(const FString& Mac) const;
+
+    /** Type/modèle lisible de l'arme à cet index (Unknown si hors Devices). */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    EVaroniaController GetWeaponController(int32 WeaponIndex) const;
+
+    /** Index de la 1re arme de ce type dans Devices (-1 si aucune). Ex: la HK416. */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    int32 FindWeaponIndexByController(EVaroniaController Type) const;
+
+    /** Tous les index d'armes de ce type (vide si aucune). */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    TArray<int32> FindWeaponIndicesByController(EVaroniaController Type) const;
+
+    // --- Debug (simule les commandes serveur de démarrage de partie) ---
+
+    /** Simule GET_SOFTPARTYSTART_RESULT : déclenche OnStartWithTuto. */
+    UFUNCTION(BlueprintCallable, Category = "Varonia|Debug")
+    void DebugStartWithTuto();
+
+    /** Simule GET_SOFTPARTYSKIPTUTOANDSTART_RESULT : déclenche OnStartWithoutTuto. */
+    UFUNCTION(BlueprintCallable, Category = "Varonia|Debug")
+    void DebugStartWithoutTuto();
+
+    /** Touche d'ouverture de l'overlay debug (global, géré par le subsystem — aucun composant à ajouter). */
+    UPROPERTY(BlueprintReadWrite, Category = "Varonia|Debug")
+    FKey DebugMenuKey = EKeys::F12;
+
+    UFUNCTION(BlueprintCallable, Category = "Varonia|Debug")
+    void ToggleDebugMenu();
+
+    UFUNCTION(BlueprintCallable, Category = "Varonia|Debug")
+    void ShowDebugMenu();
+
+    UFUNCTION(BlueprintCallable, Category = "Varonia|Debug")
+    void HideDebugMenu();
+
+    /** ID Unity (3/6/.../777) → type lisible. */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    EVaroniaController ControllerIdToType(int32 ControllerId) const;
+
+    /** Type lisible → ID Unity (3/6/.../777 ; -1 pour Unknown). */
+    UFUNCTION(BlueprintPure, Category = "Varonia|Input")
+    int32 ControllerTypeToId(EVaroniaController Type) const;
 
     // --- Spatial ---
 
@@ -191,4 +272,16 @@ private:
 
     UFUNCTION()
     void OnMqttMessage(FMqttMessage Message);
+
+    // Parse un message DeviceToUnity/<MAC>/<key> et broadcast OnWeaponInput.
+    void HandleDeviceInput(const FString& Topic, const FString& Body);
+
+    // État des boutons par MAC (bitmask : bit n = EVaroniaButton n).
+    TMap<FString, uint8> WeaponButtonState;
+
+    // --- Debug overlay (global, via input pre-processor Slate ; aucun composant requis) ---
+    TSharedRef<SWidget> BuildDebugMenu();
+    TSharedPtr<SWidget> DebugMenuWidget;
+    TSharedPtr<FVaroniaDebugInputProcessor> DebugInputProcessor;
+    bool bDebugMenuShown = false;
 };
